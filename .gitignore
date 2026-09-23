@@ -3,3 +3,18 @@ __pycache__/
 *.pyc
 .idea/
 .DS_Store
+
+# Local environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local Shanghai inputs
+/data/shanghai/*
+!/data/shanghai/README.md
+
+# Generated results
+/results/*
+!/results/README.md

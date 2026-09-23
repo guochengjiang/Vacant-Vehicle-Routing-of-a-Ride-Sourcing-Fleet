@@ -1,0 +1,2361 @@
+===== CELL 0 (code) =====
+# Softmax by group (each state s in row_idx)
+from scipy.special import softmax
+import pandas as pd
+import numpy as np
+from scipy.sparse import coo_matrix, csr_matrix, issparse, diags
+
+from scipy.sparse import lil_matrix
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+import time
+
+from numpy.linalg import solve
+
+import heapq
+from collections import defaultdict
+
+import gc
+import psutil
+import pickle
+from pathlib import Path
+
+===== CELL 1 (code) =====
+class GradientOptimizer:
+    """
+    Combined objective and gradient computation
+    """
+    def __init__(self,
+                 outgoing_dict,
+                 action_features,
+                 lambda_vec, tau, omega, M, alpha,
+                 Q, v, c, beta,
+                 init_mu,
+                 init_m,
+                 outgoing_mask,
+                 solve_sensitivities,
+                 solve_fixed_point,
+                 # Fixed-point solver parameters
+                 fixed_m_states=None,
+                 tol_m=1e-6,
+                 tol_mu=1e-6,
+                 max_iter=100000,
+                 method='hybrid',
+                 restart_interval=30,
+                 momentum=0.9,
+                 lr=0.5,
+                 phase1_tol=1e-4,
+                 heuristic=None):
+        
+        # Store parameters
+        self.outgoing_dict = outgoing_dict
+        self.action_features = action_features
+        self.lambda_vec = lambda_vec
+        self.tau = tau
+        self.omega = omega
+        self.M = M
+        self.alpha = alpha
+        self.Q = Q
+        self.v = v
+        self.c = c
+        self.beta = beta
+        self.outgoing_mask = outgoing_mask
+        self.solver_fixed_point = solve_fixed_point
+        self.solver_grad = solve_sensitivities
+        self.heuristic = heuristic
+        
+        # Fixed-point parameters
+        self.fixed_m_states = fixed_m_states
+        self.tol_m = tol_m
+        self.tol_mu = tol_mu
+        self.max_iter = max_iter
+        self.method = method
+        self.restart_interval = restart_interval
+        self.momentum = momentum
+        self.lr = lr
+        self.phase1_tol = phase1_tol
+
+        
+        # Network information
+        self.n = len(lambda_vec)
+        self.row_idx, self.col_idx = extract_state_action_pairs(outgoing_dict)
+        
+        # Warm start (instance variables)
+        self.mu_last = init_mu.copy()
+        self.m_last = init_m.copy()
+        self.init_mu = init_mu.copy()
+        self.init_m = init_m.copy()
+        
+        # Current state (instance variables)
+        self.current_state = {}
+        
+        # History
+        self.theta_hist = []
+        self.R_hist = []
+        self.m_hist = []
+        self.mu_hist = []
+        self.state_hist = []  # Full state history
+        self.grad_hist = []           # Added
+        self.grad_norm_hist = []      # Added
+        
+        # History of accepted optimizer iterations
+        self.iter_theta_hist = []
+        self.iter_R_hist = []
+        self.iter_grad_norm_hist = []
+        
+        # Cache
+        self._cache_theta = None
+        self._cache_obj = None
+        self._cache_grad = None
+    
+    def reset_warm_start(self):
+        """Reset the warm start to its initial state"""
+        self.mu_last = self.init_mu.copy()
+        self.m_last = self.init_m.copy()
+    
+    def clear_cache(self):
+        """Clear the cache"""
+        self._cache_theta = None
+        self._cache_obj = None
+        self._cache_grad = None
+    
+    def clear_history(self):
+        """Clear the history"""
+        self.theta_hist = []
+        self.R_hist = []
+        self.m_hist = []
+        self.mu_hist = []
+        self.state_hist = []  # Added
+        self.grad_hist = []           # Added
+        self.grad_norm_hist = []      # Added
+        self.iter_theta_hist = []
+        self.iter_R_hist = []
+        self.iter_grad_norm_hist = []
+    
+    
+    def _compute_fixed_point(self, theta_vec):
+        """Compute the fixed point"""
+        pi = compute_softmax_policy_by_action_features(
+            self.action_features, theta_vec, self.n, self.row_idx, self.col_idx
+        )
+        pi_dense = pi.toarray() if issparse(pi) else np.asarray(pi)
+        
+        mu, m = self.solver_fixed_point(
+            self.lambda_vec, self.tau, self.omega, self.M, self.alpha,
+            self.Q, self.outgoing_dict, pi,
+            self.mu_last, self.m_last, self.row_idx, self.col_idx,
+            self.v, self.c, self.beta,
+            fixed_m_states=self.fixed_m_states,
+            tol_m=self.tol_m,
+            tol_mu=self.tol_mu,
+            max_iter=self.max_iter,
+            method=self.method,
+            restart_interval=self.restart_interval,
+            momentum=self.momentum,
+            lr=self.lr,
+            phase1_tol=self.phase1_tol,
+            verbose=True,
+            heuristic=self.heuristic
+        )
+        
+        # Update the warm start
+        self.mu_last = mu.copy()
+        self.m_last = m.copy()
+        
+        return mu, m, pi_dense
+    
+    def _build_feature_matrix(self, k):
+        """Build the feature matrix for parameter k"""
+        x_r = np.zeros((self.n, self.n), dtype=np.float64)
+        for s, actions in self.outgoing_dict.items():
+            for a in actions:
+                x_r[s, a] = self.action_features[k][a]
+        return x_r
+    
+    def _compute(self, theta):
+        """Compute the objective and gradient"""
+        # Check the cache        
+        if (self._cache_theta is not None and 
+            np.array_equal(theta, self._cache_theta)):
+            print(f"  [Cache hit] theta = {theta}")
+            return
+
+        print(f"  [Recompute] theta = {theta}")
+        
+        print(f"[Step {len(self.theta_hist) + 1}] theta = {theta}, computing...")
+        
+        # Compute the fixed point
+        mu, m, pi_dense = self._compute_fixed_point(theta)
+        
+        # Compute R
+        kappa = compute_kappa(self.v, self.c, self.Q, self.beta)
+        R_pi = compute_R(mu, self.tau, self.omega, m, kappa, self.beta)
+        
+        N = np.sum(mu * (-self.beta * self.tau + kappa * m))
+        D = np.sum(mu * (self.tau + self.omega * m))
+        
+        dN_dm = mu * kappa
+        dN_dmu = -self.beta * self.tau + kappa * m
+        dD_dm = mu * self.omega
+        dD_dmu = self.tau + self.omega * m
+        
+        # Compute the gradient
+        K = len(theta)
+        grad_R = np.zeros(K)
+        
+        for k in range(K):
+            x_r_k = self._build_feature_matrix(k)
+            
+            dmu, dm, info = self.solver_grad(
+                self.lambda_vec, self.tau, self.omega, self.M, self.alpha,
+                self.Q, pi_dense, mu, m,
+                x_r_k, self.outgoing_mask, self.outgoing_dict
+            )
+            
+            dN_dtheta = np.dot(dN_dm, dm) + np.dot(dN_dmu, dmu)
+            dD_dtheta = np.dot(dD_dm, dm) + np.dot(dD_dmu, dmu)
+            grad_R[k] = (dN_dtheta * D - N * dD_dtheta) / (D ** 2)
+        
+            
+        # ========================================
+        # Compute the gradient norm
+        # ========================================
+        grad_norm = np.linalg.norm(-grad_R)  # Negative sign because the objective is minimize -R
+        
+        # Save the current state (instance variables)
+        self.current_state = {
+            'mu': mu, 'm': m, 
+            #'pi': pi_dense, 
+            'Q': self.Q,
+            'kappa': kappa, 'N': N, 'D': D,
+            'dN_dm': dN_dm, 'dN_dmu': dN_dmu,
+            'dD_dm': dD_dm, 'dD_dmu': dD_dmu,
+            'R': R_pi,
+            'grad': -grad_R,          # Added
+            'grad_norm': grad_norm    # Added
+        }
+        
+        # Record history
+        self.theta_hist.append(theta.copy())
+        self.R_hist.append(R_pi)
+        self.m_hist.append(m.copy())
+        self.mu_hist.append(mu.copy())
+        self.grad_hist.append(-grad_R.copy())       # Added
+        self.grad_norm_hist.append(grad_norm)       # Added
+        self.state_hist.append({
+            'mu': mu.copy(),
+            'm': m.copy(),
+            #'pi': pi_dense.copy(),
+            'kappa': kappa.copy(),
+            'N': N,
+            'D': D,
+            'dN_dm': dN_dm.copy(),
+            'dN_dmu': dN_dmu.copy(),
+            'dD_dm': dD_dm.copy(),
+            'dD_dmu': dD_dmu.copy(),
+            'R': R_pi,
+            'grad': -grad_R.copy(),       # Added
+            'grad_norm': grad_norm        # Added
+        })
+        
+        
+        
+        # Compute the gradient
+        K = len(theta)
+        grad_R = np.zeros(K)
+        
+        for k in range(K):
+            x_r_k = self._build_feature_matrix(k)
+            
+            dmu, dm, info = self.solver_grad(
+                self.lambda_vec, self.tau, self.omega, self.M, self.alpha,
+                self.Q, pi_dense, mu, m,
+                x_r_k, self.outgoing_mask, self.outgoing_dict
+            )
+            
+            dN_dtheta = np.dot(dN_dm, dm) + np.dot(dN_dmu, dmu)
+            dD_dtheta = np.dot(dD_dm, dm) + np.dot(dD_dmu, dmu)
+            grad_R[k] = (dN_dtheta * D - N * dD_dtheta) / (D ** 2)
+            
+        save_checkpoint(self)
+        # ========================================
+        # Print R and the gradient
+        # ========================================
+        print(f"[Step {len(self.theta_hist)}] theta = {theta}, R = {R_pi:.6f}, ||grad|| = {grad_norm:.2e}")
+
+        # Update the cache
+        self._cache_theta = theta.copy()
+        self._cache_obj = -R_pi
+        self._cache_grad = -grad_R
+        
+        # Delete large variables that are no longer needed
+        del pi_dense
+    
+        gc.collect()
+        mem_gb = psutil.Process().memory_info().rss / 1e9
+        print(f"  Memory: {mem_gb:.2f} GB\n")
+        
+    def _compute_objective(self, theta):
+        """Compute only the objective"""
+        if (self._cache_theta is not None and 
+            np.array_equal(theta, self._cache_theta)):
+            return
+
+        print(f"[Compute f] theta = {theta}")
+
+        # Compute the fixed point
+        mu, m, pi_dense = self._compute_fixed_point(theta)
+
+        # Compute R
+        kappa = compute_kappa(self.v, self.c, self.Q, self.beta)
+        R_pi = compute_R(mu, self.tau, self.omega, m, kappa, self.beta)
+
+        # Cache objective-related values only
+        self._cache_theta = theta.copy()
+        self._cache_obj = -R_pi
+        self._cache_mu = mu
+        self._cache_m = m
+        self._cache_pi = pi_dense
+        self._cache_kappa = kappa
+        self._cache_grad = None  # Mark the gradient as not yet evaluated
+        
+    def _compute_gradient(self, theta):
+        """Compute the gradient, assuming f has already been evaluated"""
+        if (self._cache_theta is not None and 
+            np.array_equal(theta, self._cache_theta) and
+            self._cache_grad is not None):
+            return
+
+        # Ensure f has been evaluated
+        if not np.array_equal(theta, self._cache_theta):
+            self._compute_objective(theta)
+
+        print(f"[Compute grad] theta = {theta}")
+
+        # Retrieve cached values
+        mu = self._cache_mu
+        m = self._cache_m
+        pi_dense = self._cache_pi
+        kappa = self._cache_kappa
+
+        N = np.sum(mu * (-self.beta * self.tau + kappa * m))
+        D = np.sum(mu * (self.tau + self.omega * m))
+
+        dN_dm = mu * kappa
+        dN_dmu = -self.beta * self.tau + kappa * m
+        dD_dm = mu * self.omega
+        dD_dmu = self.tau + self.omega * m
+
+        # Compute the gradient
+        K = len(theta) if hasattr(theta, '__len__') else 1
+        grad_R = np.zeros(K)
+
+        for k in range(K):
+            x_r_k = self._build_feature_matrix(k)
+
+            dmu, dm, info = self.solver_grad(
+                self.lambda_vec, self.tau, self.omega, self.M, self.alpha,
+                self.Q, pi_dense, mu, m,
+                x_r_k, self.outgoing_mask, self.outgoing_dict
+            )
+
+            dN_dtheta = np.dot(dN_dm, dm) + np.dot(dN_dmu, dmu)
+            dD_dtheta = np.dot(dD_dm, dm) + np.dot(dD_dmu, dmu)
+            grad_R[k] = (dN_dtheta * D - N * dD_dtheta) / (D ** 2)
+
+        self._cache_grad = -grad_R
+        grad_norm = np.linalg.norm(-grad_R)
+        
+        # Record history
+        self.theta_hist.append(theta.copy())
+        self.R_hist.append(-self._cache_obj)
+        self.m_hist.append(m.copy())
+        self.mu_hist.append(mu.copy())
+        self.grad_hist.append(-grad_R.copy())       # Added
+        self.grad_norm_hist.append(grad_norm)       # Added
+        self.state_hist.append({
+            'mu': mu.copy(),
+            'm': m.copy(),
+            #'pi': pi_dense.copy(),
+            'kappa': kappa.copy(),
+            'N': N,
+            'D': D,
+            'dN_dm': dN_dm.copy(),
+            'dN_dmu': dN_dmu.copy(),
+            'dD_dm': dD_dm.copy(),
+            'dD_dmu': dD_dmu.copy(),
+            'R': -self._cache_obj,
+            'grad': -grad_R.copy(),       # Added
+            'grad_norm':  grad_norm       # Added
+        })
+        
+        self._cache_pi = None  # Release the reference
+        del pi_dense
+        
+        gc.collect()
+
+        mem_gb = psutil.Process().memory_info().rss / 1e9
+        print(f"  Memory: {mem_gb:.2f} GB. ||grad|| = {grad_norm:.2e}")
+        
+        
+    def objective(self, theta):
+        """Return the objective value"""
+        self._compute_objective(theta)
+        return self._cache_obj
+
+
+    def grad(self, theta):
+        """Return the gradient"""
+        self._compute_gradient(theta)
+        return self._cache_grad
+    
+    '''
+    def objective(self, theta):
+        """Return the objective value"""
+        self._compute(theta)
+        return self._cache_obj
+
+    
+    def grad(self, theta):
+        """Return the gradient"""
+        self._compute(theta)
+        return self._cache_grad
+    '''
+    
+    def optimize(self, theta_init, method='BFGS', maxiter=100, bounds=None, gtol=1e-5):
+        """Run optimization"""
+        from scipy.optimize import minimize
+        
+        def callback(xk):
+            """Called after each BFGS iteration"""
+            self.iter_theta_hist.append(xk.copy())
+            self.iter_R_hist.append(-self._cache_obj)
+            self.iter_grad_norm_hist.append(np.linalg.norm(self._cache_grad))
+
+            print(f"\n[BFGS Iter {len(self.iter_theta_hist)}] "
+                  f"theta = {xk}, "
+                  f"R = {-self._cache_obj:.6f}, "
+                  f"||grad|| = {np.linalg.norm(self._cache_grad):.2e}")
+            print(f"\n----------------------------------------------------\n")
+
+        
+        self.clear_history()
+        self.clear_cache()
+        self.reset_warm_start()  # ← Reset to ensure reproducibility
+        
+        if bounds is not None and method == 'BFGS':
+            method = 'L-BFGS-B'
+        
+        result = minimize(
+            fun=self.objective,
+            x0=theta_init,
+            method=method,
+            jac=self.grad,
+            callback=callback,
+            bounds=bounds,
+            options={'disp': True, 'maxiter': maxiter, 'gtol': gtol}
+        )
+        
+        return result
+    
+
+    
+    def optimize_numerical(self, theta_init, maxiter=50, gtol=1e-5, epsilon=1e-6):
+        """Optimize using numerical gradients"""
+        from scipy.optimize import minimize
+
+        self.clear_history()
+        self.clear_cache()
+        self.reset_warm_start()
+
+        result = minimize(
+            fun=self.objective,
+            x0=theta_init,
+            method='BFGS',
+            options={
+                'disp': True, 
+                'maxiter': maxiter, 
+                'gtol': gtol,
+                'eps': epsilon  # Finite-difference step size
+            }
+        )
+        return result
+    
+    
+    def optimize_nelder_mead(self, theta_init, maxiter=500, xatol=1e-6, fatol=1e-6):
+        """Optimize with Nelder-Mead (derivative-free)"""
+        from scipy.optimize import minimize
+
+        self.clear_history()
+        self.clear_cache()
+        self.reset_warm_start()
+
+        result = minimize(
+            fun=self.objective,
+            x0=theta_init,
+            method='Nelder-Mead',
+            options={
+                'disp': True,
+                'maxiter': maxiter,
+                'xatol': xatol,  # Convergence tolerance for x
+                'fatol': fatol   # Convergence tolerance for f(x)
+            }
+        )
+        return result
+    
+    def numerical_gradient(self, theta, epsilon=1e-6):
+        """Compute numerical gradients, resetting the warm start each time"""
+        grad = np.zeros_like(theta)
+        
+        for i in range(len(theta)):
+            theta_plus = theta.copy()
+            theta_plus[i] += epsilon
+            
+            theta_minus = theta.copy()
+            theta_minus[i] -= epsilon
+            
+            # Reset and compute f_plus
+            self.reset_warm_start()
+            self.clear_cache()
+            f_plus = self.objective(theta_plus)
+            
+            # Reset and compute f_minus
+            self.reset_warm_start()
+            self.clear_cache()
+            f_minus = self.objective(theta_minus)
+            
+            grad[i] = (f_plus - f_minus) / (2 * epsilon)
+        
+        return grad
+    
+    def check_gradient(self, theta, epsilon=1e-6):
+        """Compare analytical and numerical gradients"""
+        self.reset_warm_start()
+        self.clear_cache()
+        analytical = self.grad(theta)
+        
+        numerical = self.numerical_gradient(theta, epsilon)
+        
+        diff = np.abs(analytical - numerical)
+        rel_err = diff / (np.abs(numerical) + 1e-8)
+        
+        print(f"Gradient comparison:")
+        print(f"  Analytical: {analytical}")
+        print(f"  Numerical: {numerical}")
+        print(f"  Difference: {diff}")
+        print(f"  Relative error: {rel_err}")
+        
+        return analytical, numerical
+
+===== CELL 2 (code) =====
+def save_checkpoint(self, filename='checkpoint.pkl', save_dir='results/checkpoints'):
+    """Save the current state"""
+
+    # Support both Jupyter and Python scripts
+    try:
+        project_root = Path(__file__).parent.parent.parent
+    except NameError:
+        project_root = Path.cwd()
+    
+    save_dir = project_root / 'results' / 'checkpoints'
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    filepath = save_dir / filename
+
+    with open(filepath, 'wb') as f:
+        pickle.dump({
+            'theta_hist': self.theta_hist,
+            'R_hist': self.R_hist,
+            'state_hist': self.state_hist,
+            'mu_last': self.mu_last,
+            'm_last': self.m_last
+        }, f)
+    #print(f"Checkpoint saved to {filepath}")
+
+
+def load_checkpoint(self, filename='checkpoint.pkl', save_dir='results/checkpoints'):
+    """Load the state"""
+    filepath = Path(save_dir) / filename
+
+    with open(filepath, 'rb') as f:
+        data = pickle.load(f)
+
+    self.theta_hist = data['theta_hist']
+    self.R_hist = data['R_hist']
+    self.state_hist = data.get('state_hist', [])
+    self.mu_last = data.get('mu_last', self.init_mu.copy())
+    self.m_last = data.get('m_last', self.init_m.copy())
+
+    print(f"Loaded {len(self.theta_hist)} steps from {filepath}")
+    print(f"Last theta: {self.theta_hist[-1]}")
+    print(f"Last R: {self.R_hist[-1]}")
+
+    return self.theta_hist[-1]
+
+===== CELL 3 (code) =====
+def solve_sensitivities_direct(
+    lambda_vec, tau, omega, M, alpha,
+    Q, pi, mu, m,
+    x_r, outgoing_mask,
+    outgoing_dict
+):
+    """
+    Direct solver (corrected version)
+    """
+    from scipy.sparse import issparse
+    
+    n = len(lambda_vec)
+    
+    # Convert to dense
+    if issparse(pi):
+        pi = pi.toarray()
+    if issparse(Q):
+        Q = Q.toarray()
+    
+    pi = np.asarray(pi, dtype=np.float64)
+    Q = np.asarray(Q, dtype=np.float64)
+    x_r = np.asarray(x_r, dtype=np.float64)
+    outgoing_mask = np.asarray(outgoing_mask, dtype=np.float64)
+    mu = np.asarray(mu, dtype=np.float64).flatten()
+    m = np.asarray(m, dtype=np.float64).flatten()
+    tau = np.asarray(tau, dtype=np.float64).flatten()
+    omega = np.asarray(omega, dtype=np.float64).flatten()
+    lambda_vec = np.asarray(lambda_vec, dtype=np.float64).flatten()
+    
+    eps = 1e-12
+    mu_safe = np.maximum(mu, eps)
+    
+    # Precompute
+    t = tau + m * omega
+    w = np.dot(mu, t)
+    c = (1 - m) * alpha * lambda_vec / M
+    
+    P = (1 - m)[:, np.newaxis] * pi * outgoing_mask + m[:, np.newaxis] * Q
+    
+    weighted_x = np.sum(pi * x_r * outgoing_mask, axis=1)
+    dpi_dtheta = pi * (x_r - weighted_x[:, np.newaxis]) * outgoing_mask
+    
+    f0 = np.dot(mu * (1 - m), dpi_dtheta)
+    
+    Delta = Q - pi * outgoing_mask
+    
+    a = c / mu_safe
+    v = mu * omega
+    
+    # Construct matrix L: dm = L @ dmu
+    A_mmu = np.outer(c / mu_safe, t) - np.diag(c * w / mu_safe**2)
+    A_mm = np.outer(a, v)
+    L = np.linalg.solve(np.eye(n) - A_mm, A_mmu)
+    
+    # Construct G_matrix: G(dmu) = G_matrix @ dmu
+    # G[u] = sum_s mu[s] * Delta[s,u] * dm[s] = sum_s mu[s] * Delta[s,u] * (L @ dmu)[s]
+    # G[u] = sum_s sum_j mu[s] * Delta[s,u] * L[s,j] * dmu[j]
+    # G_matrix[u,j] = sum_s mu[s] * Delta[s,u] * L[s,j]
+    G_matrix = (mu[:, np.newaxis] * Delta).T @ L  # shape (n, n)
+    
+    # Equation: dmu - dmu @ P - G(dmu) = f0
+    # Equivalently: dmu - P^T @ dmu - G_matrix @ dmu = f0
+    # Equivalently: (I - P^T - G_matrix) @ dmu = f0
+    
+    A_full = np.eye(n) - P.T - G_matrix  # ← Correction: use G_matrix without transposing it
+    
+    # Add the constraint sum(dmu) = 0
+    A_full[0, :] = 1.0
+    f0_constrained = f0.copy()
+    f0_constrained[0] = 0.0
+    
+    # Solve directly
+    dmu = np.linalg.solve(A_full, f0_constrained)
+    dm = L @ dmu
+    
+    return dmu, dm, {'sum_dmu': np.sum(dmu)}
+
+===== CELL 4 (code) =====
+def compute_joint_fixed_point_final(
+    lambda_vec, tau, omega, M, alpha, Q, outgoing_dict, pi,
+    init_mu, init_m, row_idx, col_idx, v, c, beta,
+    fixed_m_states=None,
+    tol_m=1e-6, tol_mu=1e-6, max_iter=100000,
+    method='hybrid',
+    restart_interval=30,
+    momentum=0.9,
+    lr=0.5,
+    phase1_tol=1e-4,
+    verbose=True,
+    heuristic=None
+):
+    """
+    Final joint fixed-point solver
+    
+    Parameters:
+        fixed_m_states: Indices of states forced to m=1 (e.g., boundary states)
+        tol_m, tol_mu: Convergence tolerances
+        method: 'msa', 'momentum', 'hybrid'
+        restart_interval: MSA restart interval (recommended: 20-30)
+        momentum: Momentum coefficient (0.8-0.95)
+        lr: Learning rate (0.3-0.7)
+        phase1_tol: Phase 1 tolerance for the hybrid method
+    """
+    import time
+    
+    n = len(lambda_vec)
+    m = init_m.copy().astype(np.float64)
+    mu = init_mu.copy().astype(np.float64)
+    
+    # Handle fixed_m_states
+    if fixed_m_states is None:
+        fixed_m_states = np.array([], dtype=np.int64)
+    else:
+        fixed_m_states = np.asarray(fixed_m_states, dtype=np.int64)
+    
+    has_fixed_states = len(fixed_m_states) > 0
+    
+    if has_fixed_states:
+        free_states_mask = np.ones(n, dtype=bool)
+        free_states_mask[fixed_m_states] = False
+    
+    t0 = time.time()
+    local_iter = 1
+    
+    # Momentum variables
+    if method in ['momentum', 'hybrid']:
+        v_m = np.zeros_like(m)
+        v_mu = np.zeros_like(mu)
+        phase1_done = False
+    
+    for outer in range(max_iter):
+        m_old = m.copy()
+        mu_old = mu.copy()
+        
+        # ========================================
+        # Step 1: Compute m_target
+        # ========================================
+        
+        if heuristic == None:
+            weighted_sum = np.dot(mu, tau + m * omega)
+            safe_mu = np.where(mu > 0, mu, 1.0)
+            exponent = -alpha * lambda_vec * weighted_sum / (M * safe_mu)
+            m_target = 1 - np.exp(exponent)
+            m_target = np.where(mu > 0, m_target, 1.0)
+        
+        ## competition-free
+        elif heuristic == 'CF':
+            m_target = np.where(lambda_vec > 0, 1.0, 0.0)
+        
+        # Enforce m=1 for boundary states
+        if has_fixed_states:
+            m_target[fixed_m_states] = 1.0
+        
+        # ========================================
+        # Step 2: build P
+        # ========================================
+        P = build_P_matrix(Q, m_target, pi, outgoing_dict, row_idx, col_idx)
+        
+        # ========================================
+        # Step 3: Compute mu_target
+        # ========================================
+        mu_target = mu @ P
+        
+        # ========================================
+        # Step 4: Compute the actual residual (target - old)
+        # ========================================
+        if has_fixed_states:
+            m_residual = np.max(np.abs(m_target[free_states_mask] - m_old[free_states_mask]))
+        else:
+            m_residual = np.max(np.abs(m_target - m_old))
+        
+        mu_residual = 0.5 * np.sum(np.abs(mu_target - mu_old))
+        
+        # ========================================
+        # Step 5: Update m and mu
+        # ========================================
+        if method == 'msa':
+            a = local_iter / (local_iter + 1)
+            m = a * m_target + (1 - a) * m_old
+            mu = a * mu_target + (1 - a) * mu_old
+            
+        elif method == 'momentum':
+            v_m = momentum * v_m + lr * (m_target - m)
+            v_mu = momentum * v_mu + lr * (mu_target - mu)
+            m = m + v_m
+            mu = mu + v_mu
+            m = np.clip(m, 0, 1)
+            mu = np.maximum(mu, 0)
+            
+        elif method == 'hybrid':
+            if not phase1_done and (m_residual > phase1_tol or mu_residual > phase1_tol):
+                # Phase 1: Momentum
+                v_m = momentum * v_m + lr * (m_target - m)
+                v_mu = momentum * v_mu + lr * (mu_target - mu)
+                m = m + v_m
+                mu = mu + v_mu
+                m = np.clip(m, 0, 1)
+                mu = np.maximum(mu, 0)
+            else:
+                # Phase 2: MSA
+                if not phase1_done:
+                    phase1_done = True
+                    local_iter = 1
+                    if verbose:
+                        print(f"    Phase 1 completed: iter={outer}, time={time.time()-t0:.1f}s")
+                
+                a = local_iter / (local_iter + 1)
+                m = a * m_target + (1 - a) * m_old
+                mu = a * mu_target + (1 - a) * mu_old
+        
+        # Enforce m=1 for boundary states
+        if has_fixed_states:
+            m[fixed_m_states] = 1.0
+        
+        # Normalize mu
+        mu = mu / mu.sum()
+        
+        # Update the MSA counter
+        local_iter += 1
+        if method in ['msa', 'hybrid'] and restart_interval and local_iter >= restart_interval:
+            local_iter = 1
+        
+        # ========================================
+        # Step 6: Check convergence
+        # ========================================
+        if m_residual < tol_m and mu_residual < tol_mu:
+            if verbose:
+                kappa_val = compute_kappa(v, c, Q, beta)
+                R_pi = compute_R(mu, tau, omega, m, kappa_val, beta)
+                print(f"Converged: iter={outer}, time={time.time()-t0:.1f}s")
+                print(f"  m_residual={m_residual:.2e}, mu_residual={mu_residual:.2e}, R={R_pi:.2f}")
+            break
+        
+        if verbose and outer % 2000 == 0:
+            kappa_val = compute_kappa(v, c, Q, beta)
+            R_pi = compute_R(mu, tau, omega, m, kappa_val, beta)
+            print(f"  Inner iter={outer}, m_res={m_residual:.2e}, mu_res={mu_residual:.2e}, R={R_pi:.4f}")
+            if has_fixed_states:
+                print(f"  Mean m for fixed states: {m[fixed_m_states].mean():.4f}")
+                print(f"  Total mu for fixed states: {mu[fixed_m_states].sum():.6f}")
+    
+    else:
+        if verbose:
+            print(f"Warning: No convergence; maximum iterations reached: {max_iter}")
+            print(f"  m_residual={m_residual:.2e}, mu_residual={mu_residual:.2e}")
+    
+    # ========================================
+    # Final verification
+    # ========================================
+    if verbose:
+        P_final = build_P_matrix(Q, m, pi, outgoing_dict, row_idx, col_idx)
+        stationarity_error = np.linalg.norm(mu @ P_final - mu)
+        print(f"  Stationarity error: {stationarity_error:.2e}")
+        
+        if has_fixed_states:
+            print(f"  Mean m for fixed states: {m[fixed_m_states].mean():.4f}")
+            print(f"  Total mu for fixed states: {mu[fixed_m_states].sum():.6f}")
+    
+    return mu, m
+
+===== CELL 5 (code) =====
+def extract_state_action_pairs(outgoing_dict):
+    row_idx, col_idx = [], []
+    for s, actions in outgoing_dict.items():
+        row_idx.extend([s] * len(actions))
+        col_idx.extend(actions)
+    return np.array(row_idx), np.array(col_idx)
+
+def compute_softmax_policy_by_action_features(action_features, theta, n_links, row_idx, col_idx):
+
+    vals = sum(theta[i] * f[col_idx] for i, f in enumerate(action_features))
+
+
+    sort_idx = np.argsort(row_idx)
+    row_idx_sorted = row_idx[sort_idx]
+    col_idx_sorted = col_idx[sort_idx]
+    vals_sorted = vals[sort_idx]
+
+
+    pi_data = np.zeros_like(vals_sorted)
+    i = 0
+    while i < len(row_idx_sorted):
+        s = row_idx_sorted[i]
+        j = i
+        while j < len(row_idx_sorted) and row_idx_sorted[j] == s:
+            j += 1
+        scores = vals_sorted[i:j]
+        exp_scores = np.exp(scores - np.max(scores))  # for numerical stability
+        probs = exp_scores / np.sum(exp_scores)
+        pi_data[i:j] = probs
+        i = j
+
+
+    pi_sparse = coo_matrix((pi_data, (row_idx_sorted, col_idx_sorted)), shape=(n_links, n_links)).tocsr()
+    return pi_sparse
+
+
+def build_P_matrix(Q, m, Pi, outgoing_dict, row_idx, col_idx):
+
+    n = Q.shape[0]
+    P = m[:, None] * Q  # baseline: m_s * q_su  correct!
+    
+    #Pi_dense = Pi.toarray()
+    #delta = (1 - m[row_idx]) * Pi_dense[row_idx, col_idx]
+    # Convert to a dense matrix
+    if issparse(Pi):
+        Pi_dense = Pi.toarray()
+    else:
+        Pi_dense = np.asarray(Pi)
+        
+    delta = (1 - m[row_idx]) * Pi_dense[row_idx, col_idx]
+    
+    P[row_idx, col_idx] += delta
+    
+    #delta = (1 - m[row_idx]) * Pi[row_idx, col_idx].A1  # .A1 makes it 1D
+
+    #P[row_idx, col_idx] += delta
+
+
+    return P
+
+
+
+def compute_kappa(v, c, q, beta):
+    return np.sum((v - beta * c) * q, axis=1)
+
+def compute_R(mu, tau, omega, m, kappa, beta):
+    num = np.sum(mu * (-beta * tau + kappa * m))
+    denom = np.sum(mu * (tau + omega * m))
+    return num / denom if denom > 0 else -np.inf
+
+===== CELL 6 (code) =====
+c = np.load('Input/c_final.npy')
+v = np.load('Input/v_final.npy')
+Q = np.load('Input/Q_final.npy')
+lambda_vec = np.load('Input/lambda_vec_final.npy')
+tau = np.load('Input/tau_final.npy')
+omega = np.load('Input/omega_final.npy')
+features = np.load('Input/feature_profit_final.npy') ### [[],[],[]]
+init_dist = np.load('Input/init_dist_final.npy')
+outgoing_links = pd.read_pickle('Input/outgoing_links_final.pkl')
+n, n_links = len(lambda_vec), len(lambda_vec)
+
+init_m = np.full(n_links, 0.2, dtype=np.float64)
+
+
+outgoing_mask = np.zeros((n, n), dtype=np.float64)
+for s, actions in outgoing_links.items():
+    outgoing_mask[s, actions] = 1.0
+    
+    
+# Boundary states
+zero_row_indices = None
+
+alpha = 1
+beta = 30
+
+===== CELL 7 (code) =====
+row_idx, col_idx = extract_state_action_pairs(outgoing_links)
+
+===== CELL 8 (code) =====
+M = 5000
+alpha = 1
+beta =30
+
+action_features_standard = features.copy()
+# Normalize features to [0, 1] or [-1, 1]
+for k in range(len(action_features_standard)):
+    feat = action_features_standard[k]
+    feat_min = feat.min()
+    feat_max = feat.max()
+    action_features_standard[k] = (feat - feat_min) / (feat_max - feat_min + 1e-8)
+
+outgoing_mask = np.zeros((n, n), dtype=np.float64)
+for s, actions in outgoing_links.items():
+    outgoing_mask[s, actions] = 1.0
+    
+    
+# Boundary states
+zero_row_indices = None
+init_m = np.full(n_links, 0.2, dtype=np.float32)
+
+===== CELL 9 (code) =====
+# ============================================================
+# Simulation with Real Discrete-Event Matching
+# ============================================================
+
+import random
+
+def sample_action(pi, state):
+    """Sample an action from a sparse or dense policy"""
+    if issparse(pi):
+        row = pi.getrow(state)
+        actions = row.indices
+        probs = row.data
+    else:
+        row = pi[state]
+        actions = np.where(row > 0)[0]
+        probs = row[actions]
+    if len(actions) == 0:
+        return state
+    probs = probs / probs.sum()
+    return np.random.choice(actions, p=probs)
+
+
+def sample_destination(state, Q):
+    """Sample a passenger destination"""
+    probs = Q[state]
+    if probs.sum() < 1e-10:
+        return state
+    probs = probs / probs.sum()
+    return np.random.choice(len(probs), p=probs)
+
+
+def make_uniform_policy(outgoing_dict, n_links):
+    """Random Walk: uniform over actions"""
+    pi = np.zeros((n_links, n_links))
+    for s, actions in outgoing_dict.items():
+        prob = 1.0 / len(actions)
+        for a in actions:
+            pi[s, a] = prob
+    return pi
+
+
+def make_hotspot_policy(outgoing_dict, n_links, lambda_vec, temperature=1.0):
+    """Hotspot: prefer high demand links"""
+    pi = np.zeros((n_links, n_links))
+    for s, actions in outgoing_dict.items():
+        weights = np.array([lambda_vec[a] for a in actions])
+        weights = weights - weights.max()
+        weights = np.exp(temperature * weights)
+        weights = weights / weights.sum()
+        for i, a in enumerate(actions):
+            pi[s, a] = weights[i]
+    return pi
+
+
+
+
+
+
+===== CELL 10 (code) =====
+def run_simulation_real(pi, M, sim_hours=12, warmup_hours=2,
+                        tick_duration=20, verbose=True,
+                        lambda_input=None):
+    """
+    Simulation with discrete matching events.
+    
+    Parameters
+    ----------
+    pi : policy (sparse or dense)
+    M : fleet size
+    sim_hours : total simulation hours (including warmup)
+    warmup_hours : warmup period (not counted in statistics)
+    tick_duration : seconds per tick
+    verbose : print progress
+    lambda_input : scaled lambda (if None, use global lambda_vec)
+    
+    Returns
+    -------
+    avg_reward, total_matched, trajectories, stats
+    
+    trajectories: list of (car_id, link_id, matched_bool, time_sec)
+    """
+    lam = lambda_input if lambda_input is not None else lambda_vec
+    
+    # Convert tau and c from hours to seconds
+    tau_sec = tau * 3600
+    c_sec = c * 3600
+    
+    ticks_per_hour = int(3600 / tick_duration)
+    n_ticks = int(sim_hours * ticks_per_hour)
+    warmup_ticks = int(warmup_hours * ticks_per_hour)
+    effective_hours = sim_hours - warmup_hours
+    
+    # Initialize the fleet
+    fleet = []
+    for i in range(M):
+        loc = np.random.choice(n_links, p=init_dist)
+        fleet.append({
+            'status': 'empty',
+            'location': loc,
+            'time_left': tau_sec[loc],
+            'destination': None,
+        })
+    
+    # Number of waiting passengers on each link
+    waiting_passengers = np.zeros(n_links)
+    
+    # Statistics
+    total_reward = 0.0
+    total_matched = 0
+    total_unmatched = 0
+    trajectories = []
+    z_sum = np.zeros(n_links)
+    z_count = 0
+    
+    if verbose:
+        print(f'Simulation: M={M}, sim={sim_hours}h, warmup={warmup_hours}h, tick={tick_duration}s')
+    
+    for tick in range(n_ticks):
+        recording = (tick >= warmup_ticks)
+        current_time = tick * tick_duration  # seconds
+        
+        # === 1. Passenger arrivals (Poisson) ===
+        expected_arrivals = lam * (tick_duration / 3600)
+        arrivals = np.random.poisson(expected_arrivals)
+        waiting_passengers += arrivals
+        
+        # === 2. Vehicle movement and matching ===
+        for car_idx, car in enumerate(fleet):
+            car['time_left'] -= tick_duration
+            
+            while car['time_left'] <= 0:
+                overshoot = -car['time_left']
+                
+                if car['status'] == 'empty':
+                    s = car['location']
+                    
+                    if waiting_passengers[s] > 0:
+                        # === Matched ===
+                        waiting_passengers[s] -= 1
+                        car['status'] = 'occupied'
+                        dest = sample_destination(s, Q)
+                        car['destination'] = dest
+                        car['location'] = dest
+                        trip_time = c_sec[s, dest] if c_sec[s, dest] > 0 else tau_sec[s]
+                        car['time_left'] = trip_time - overshoot
+                        if recording:
+                            total_reward += v[s, dest] - beta * (tau[s] + c[s, dest])
+                            total_matched += 1
+                            trajectories.append((car_idx, s, True, current_time))
+                    else:
+                        # === Not matched ===
+                        next_link = sample_action(pi, s)
+                        car['location'] = next_link
+                        car['time_left'] = tau_sec[next_link] - overshoot
+                        if recording:
+                            total_reward -= beta * tau[s]
+                            total_unmatched += 1
+                            trajectories.append((car_idx, s, False, current_time))
+                else:
+                    # === Occupied trip completed -> vacant ===
+                    car['status'] = 'empty'
+                    next_link = sample_action(pi, car['location'])
+                    car['location'] = next_link
+                    car['time_left'] = tau_sec[next_link] - overshoot
+                    car['destination'] = None
+        
+        # === 3. Record the vacant-vehicle distribution ===
+        if recording:
+            empty_count = np.zeros(n_links)
+            for car in fleet:
+                if car['status'] == 'empty':
+                    empty_count[car['location']] += 1
+            z_sum += empty_count
+            z_count += 1
+        
+        # === 4. Print progress ===
+        if verbose and (tick + 1) % ticks_per_hour == 0:
+            n_empty = sum(1 for car in fleet if car['status'] == 'empty')
+            hour = (tick + 1) / ticks_per_hour
+            avg_so_far = total_reward / max(hour - warmup_hours, 1e-10) / M
+            print(f'  Hour {hour:.0f}: empty={n_empty}/{M} ({100*n_empty/M:.1f}%), '
+                  f'matched={total_matched}, waiting={waiting_passengers.sum():.0f}, '
+                  f'avg_R={avg_so_far:.2f}')
+    
+    avg_reward = total_reward / effective_hours / M
+    match_rate = total_matched / max(total_matched + total_unmatched, 1)
+    
+    stats = {
+        'total_matched': total_matched,
+        'total_unmatched': total_unmatched,
+        'match_rate': match_rate,
+        'avg_reward': avg_reward,
+        'effective_hours': effective_hours,
+        'remaining_passengers': waiting_passengers.sum(),
+        'z_avg': z_sum / z_count if z_count > 0 else np.ones(n_links),
+    }
+    
+    if verbose:
+        print(f'\n=== Results ===')
+        print(f'  Avg reward per vehicle per hour: {avg_reward:.2f}')
+        print(f'  Total matched: {total_matched}')
+        print(f'  Match rate: {match_rate:.4f}')
+    
+    return avg_reward, total_matched, trajectories, stats
+
+===== CELL 11 (code) =====
+def estimate_alpha_from_trajectories(trajectories, lambda_vec, tau, z_avg,
+                                      bounds=(0.01, 5.0)):
+    """
+    Estimate the matching-function parameter alpha from simulation trajectories.
+    
+    Maximize LL2:
+        LL2 = Σ(unmatched) log(1-m) + Σ(matched) log(m)
+        m_s = 1 - exp(-alpha * lambda_s * tau_s / z_s)
+    
+    Parameters
+    ----------
+    trajectories : list of (car_id, link_id, matched_bool, time_sec)
+                   or list of (link_id, matched_bool)
+    lambda_vec : array, passenger arrival rates (per hour)
+    tau : array, link travel times (hours)
+    z_avg : array, average vacant taxi count per link
+    bounds : tuple, search bounds for alpha
+    
+    Returns
+    -------
+    alpha_hat : float
+    ll2_value : float
+    """
+    from scipy.optimize import minimize_scalar
+    
+    # Support both 4-tuples and 2-tuples
+    if len(trajectories[0]) == 4:
+        links = np.array([t[1] for t in trajectories])
+        matched = np.array([t[2] for t in trajectories], dtype=float)
+    else:
+        links = np.array([t[0] for t in trajectories])
+        matched = np.array([t[1] for t in trajectories], dtype=float)
+    
+    # lambda * tau / z
+    safe_z = np.maximum(z_avg[links], 1e-10)
+    ratio = lambda_vec[links] * tau[links] / safe_z
+    
+    # Keep only transitions with lambda > 0
+    valid = lambda_vec[links] > 0
+    ratio_valid = ratio[valid]
+    matched_valid = matched[valid]
+    
+    if len(ratio_valid) == 0:
+        print('Warning: no valid transitions')
+        return 1.0, 0.0
+    
+    def neg_LL2(alpha):
+        m = 1 - np.exp(-alpha * ratio_valid)
+        m = np.clip(m, 1e-10, 1 - 1e-10)
+        ll = np.sum(matched_valid * np.log(m) + (1 - matched_valid) * np.log(1 - m))
+        return -ll
+    
+    result = minimize_scalar(neg_LL2, bounds=bounds, method='bounded')
+    alpha_hat = result.x
+    ll2_value = -result.fun
+    
+    m_est = 1 - np.exp(-alpha_hat * ratio_valid)
+    print(f'Alpha estimation: α̂ = {alpha_hat:.4f}')
+    print(f'  LL2 = {ll2_value:.2f}')
+    print(f'  Observed match rate: {matched_valid.mean():.4f}')
+    print(f'  Estimated m mean (λ>0): {m_est.mean():.4f}')
+    print(f'  N transitions: {len(matched_valid)} (λ>0) / {len(matched)} (total)')
+    
+    return alpha_hat, ll2_value
+
+===== CELL 12 (code) =====
+
+
+===== CELL 13 (code) =====
+
+
+===== CELL 14 (code) =====
+
+# ============================================================
+# Step 1: Simulate a mixture of policies to estimate alpha
+# ============================================================
+
+M = 5000
+
+# Prepare multiple policies
+pi_rw = make_uniform_policy(outgoing_links, n_links)
+pi_hotspot_low = make_hotspot_policy(outgoing_links, n_links, lambda_vec, temperature=0.5)
+pi_hotspot_high = make_hotspot_policy(outgoing_links, n_links, lambda_vec, temperature=2.0)
+
+policies_for_estimation = {
+    'Random Walk': pi_rw,
+    'Hotspot (temp=0.5)': pi_hotspot_low,
+    'Hotspot (temp=2.0)': pi_hotspot_high,
+}
+
+# Collect all trajectories
+all_trajectories = []
+# Collect z_avg for each policy
+all_z_avg = []
+
+for name, pi_est in policies_for_estimation.items():
+    print(f'\n{"="*60}')
+    print(f'Running simulation with: {name}')
+    print(f'{"="*60}')
+    avg_R, matched, traj, stats = run_simulation_real(
+        pi_est, M=M, sim_hours=12, warmup_hours=2, verbose=True
+    )
+    all_trajectories.extend(traj)
+    all_z_avg.append(stats['z_avg'])
+    print(f'{name}: avg_R = {avg_R:.2f}, matched = {matched}')
+    
+
+z_avg_combined = np.mean(all_z_avg, axis=0)
+
+
+
+# Estimate alpha
+print(f'\n{"="*60}')
+print(f'Estimating alpha from {len(all_trajectories)} transitions')
+print(f'{"="*60}')
+
+
+alpha_hat, ll2 = estimate_alpha_from_trajectories(
+    all_trajectories, lambda_vec, tau, z_avg_combined
+)
+
+# Update alpha
+alpha = alpha_hat
+print(f'\n>>> Using estimated alpha = {alpha:.4f} for optimization')
+
+
+===== CELL 15 (code) =====
+with open("results/simulation_data_M5000_Jun9_iter0.pkl", "rb") as f:
+    all_trajectories_saved = pickle.load(f)
+    
+all_trajectories = all_trajectories_saved['trajectories']
+z_avg_combined = all_trajectories_saved['z_avg_combined']
+
+===== CELL 16 (code) =====
+
+
+===== CELL 17 (code) =====
+# Check the scale of lambda_vec
+print(f"lambda_vec sum: {lambda_vec.sum():.0f}")   # Total passenger arrivals per hour
+print(f"lambda_vec mean: {lambda_vec.mean():.2f}")
+print(f"lambda_vec > 0 count: {(lambda_vec > 0).sum()}")
+print(f"n_links: {n_links}")
+
+# Hourly arrivals versus hourly service capacity
+print(f"\nPassenger arrivals per hour: {lambda_vec.sum():.0f}")
+print(f"Arrivals over 12 hours: {lambda_vec.sum() * 12:.0f}")
+
+# Based on the simulation results
+# 247,944 matches in 10 hours, approximately 24,800 per hour
+# However, 58,000 passengers arrive per hour
+import pickle
+
+M = 5000
+lambda_sim = lambda_vec * (M / 12000)# → Demand exceeds supply; passengers continue to accumulate
+
+===== CELL 18 (code) =====
+
+# Estimate alpha
+alpha_hat, ll2 = estimate_alpha_from_trajectories(
+    all_trajectories, lambda_sim, tau, z_avg_combined
+)
+
+alpha = alpha_hat
+
+===== CELL 19 (code) =====
+tau
+
+===== CELL 20 (code) =====
+
+
+# Estimate alpha
+alpha_hat, ll2 = estimate_alpha_from_trajectories(
+    all_trajectories, lambda_sim, tau, z_avg_combined
+)
+alpha = alpha_hat
+
+===== CELL 21 (code) =====
+alpha
+
+===== CELL 22 (code) =====
+### Optimal policy M = 5000
+
+M = 5000
+
+optimizer = GradientOptimizer(
+    outgoing_dict= outgoing_links,
+    action_features= action_features_standard,
+    lambda_vec= lambda_sim,
+    tau= tau,
+    omega=omega,
+    M=M,
+    alpha=alpha,  # estimated from simulation
+    Q=Q,
+    v=v,
+    c=c,
+    beta=beta,
+    init_mu=init_dist,
+    init_m=init_m,
+    outgoing_mask=outgoing_mask,
+    solve_sensitivities=solve_sensitivities_direct,
+    solve_fixed_point=compute_joint_fixed_point_final,
+    tol_m=1e-6,
+    tol_mu=1e-6,
+    max_iter = 300000,
+    method='msa',
+    restart_interval=30,
+    momentum=0.8,
+    lr=0.5,
+    phase1_tol=1e-4
+)
+
+# Run optimization
+t1 = time.time()
+theta_init = np.array([0.0])
+result = optimizer.optimize(theta_init, maxiter=1000, gtol=1e-5)
+t2 = time.time()
+
+===== CELL 23 (code) =====
+alpha
+
+===== CELL 24 (code) =====
+feat_ranges = np.array([features[k].max() - features[k].min() for k in range(len(features))])
+
+theta_original_hist = [theta_std / (feat_ranges + 1e-8) for theta_std in optimizer.theta_hist]
+
+
+===== CELL 25 (code) =====
+# After optimization
+import pickle
+
+parameter_dict = dict(alpha=alpha, beta=beta, tol_m = 1e-6, tol_mu = 1e-6, method = 'msa', intervals = 30, M = M, gtol=1e-5)
+
+results_to_save = {
+    'theta_hist': optimizer.theta_hist,
+    'theta_hist_original': theta_original_hist,
+    'R_hist': optimizer.R_hist,
+    'theta_hist_BFGS': optimizer.iter_theta_hist,
+    'R_hist_BFGS': optimizer.iter_R_hist,
+    'm_hist': optimizer.m_hist,
+    'mu_hist': optimizer.mu_hist,
+    'state_hist': optimizer.state_hist,
+    'optimal_theta': result.x,
+    'optimal_R': -result.fun,
+    'Duration': t2-t1,
+    'nfev': result.nfev,
+    'njev': result.njev,
+    'Full_result': result,
+    'Parameters': parameter_dict
+}
+
+with open('results/optimization_results_M5000_SEP12_optimal_lINK_SCALE.pkl', 'wb') as f:
+    pickle.dump(results_to_save, f)
+
+===== CELL 26 (code) =====
+# Compute the policy from the optimal theta
+theta_opt = result.x  # Or specify the optimal value manually
+pi_opt = compute_softmax_policy_by_action_features(
+    action_features_standard, theta_opt, n_links, row_idx, col_idx
+)
+
+# Simulation
+avg_R, matched, traj, stats = run_simulation_real(
+    pi_opt, M=5000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+# Run a random walk for comparison
+pi_rw = make_uniform_policy(outgoing_links, n_links)
+avg_R_rw, matched_rw, traj_rw, stats_rw = run_simulation_real(
+    pi_rw, M=5000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+print(f'\n=== Comparison ===')
+print(f'Random Walk:  sim_R = {stats_rw["avg_reward"]:.2f}')
+print(f'Optimal:      sim_R = {stats["avg_reward"]:.2f}')
+
+===== CELL 27 (code) =====
+import os
+import numpy as np
+import pickle
+
+os.makedirs('result/', exist_ok=True)
+
+def run_repeated_simulation(pi, name, n_runs=10, M=5000, sim_hours=12,
+                             warmup_hours=2, lambda_input=lambda_sim,
+                             save_trajectories=True):
+    avg_R_list = []
+    matched_list = []
+    unmatched_list = []
+    match_rate_list = []
+    remaining_list = []
+    z_avg_list = []
+    all_traj_runs = []
+
+    for run in range(n_runs):
+        print(f'\n{"="*60}')
+        print(f'{name} run {run+1}/{n_runs}')
+        print(f'{"="*60}')
+
+        avg_R, matched, traj, stats = run_simulation_real(
+            pi, M=M, sim_hours=sim_hours, warmup_hours=warmup_hours,
+            verbose=False, lambda_input=lambda_input
+        )
+
+        avg_R_list.append(stats['avg_reward'])
+        matched_list.append(stats['total_matched'])
+        unmatched_list.append(stats['total_unmatched'])
+        match_rate_list.append(stats['match_rate'])
+        remaining_list.append(stats['remaining_passengers'])
+        z_avg_list.append(stats['z_avg'])
+        if save_trajectories:
+            all_traj_runs.append(traj)
+
+        print(f'  avg_R={stats["avg_reward"]:.2f}, match_rate={stats["match_rate"]:.4f}')
+
+    summary = {
+        'name': name,
+        'avg_R_mean': np.mean(avg_R_list),
+        'avg_R_std': np.std(avg_R_list),
+        'avg_R_all': np.array(avg_R_list),
+        'matched_mean': np.mean(matched_list),
+        'matched_std': np.std(matched_list),
+        'unmatched_mean': np.mean(unmatched_list),
+        'unmatched_std': np.std(unmatched_list),
+        'match_rate_mean': np.mean(match_rate_list),
+        'match_rate_std': np.std(match_rate_list),
+        'remaining_mean': np.mean(remaining_list),
+        'remaining_std': np.std(remaining_list),
+        'z_avg_mean': np.mean(z_avg_list, axis=0),
+        'z_avg_std': np.std(z_avg_list, axis=0),
+        'n_runs': n_runs,
+    }
+
+    print(f'\n{"="*60}')
+    print(f'{name} Summary (n={n_runs})')
+    print(f'{"="*60}')
+    print(f'avg_R      = {summary["avg_R_mean"]:.2f} ± {summary["avg_R_std"]:.2f}')
+    print(f'match_rate = {summary["match_rate_mean"]:.4f} ± {summary["match_rate_std"]:.4f}')
+    print(f'matched    = {summary["matched_mean"]:.0f} ± {summary["matched_std"]:.0f}')
+
+    save_path = f'result/{name}_repeated_M{M}.pkl'
+    with open(save_path, 'wb') as f:
+        pickle.dump({
+            'summary': summary,
+            'all_trajectories': all_traj_runs,  # Set save_trajectories=False to omit trajectories from saved results
+        }, f)
+    print(f'\nSaved to {save_path}')
+
+    return summary
+
+
+# Run each policy separately
+summary_rw = run_repeated_simulation(pi_rw, 'random_walk', n_runs=10)
+#summary_opt = run_repeated_simulation(pi_opt, 'optimal', n_runs=10)
+# summary_hotspot_low = run_repeated_simulation(pi_hotspot_low, 'hotspot_low', n_runs=10)
+# ...
+
+===== CELL 28 (code) =====
+summary_rw
+
+===== CELL 29 (code) =====
+result.x
+
+===== CELL 30 (code) =====
+
+
+===== CELL 31 (code) =====
+### Optimal policy M = 5000
+
+M = 5000
+
+optimizer_CF = GradientOptimizer(
+    outgoing_dict= outgoing_links,
+    action_features= action_features_standard,
+    lambda_vec= lambda_sim,
+    tau= tau,
+    omega=omega,
+    M=M,
+    alpha=alpha,  # estimated from simulation
+    Q=Q,
+    v=v,
+    c=c,
+    beta=beta,
+    init_mu=init_dist,
+    init_m=init_m,
+    outgoing_mask=outgoing_mask,
+    solve_sensitivities=solve_sensitivities_direct,
+    solve_fixed_point=compute_joint_fixed_point_final,
+    tol_m=1e-6,
+    tol_mu=1e-6,
+    max_iter = 300000,
+    method='msa',
+    restart_interval=30,
+    momentum=0.8,
+    lr=0.5,
+    phase1_tol=1e-4,
+    heuristic = 'CF'
+)
+
+# Run optimization
+t1 = time.time()
+theta_init = np.array([0.0])
+result = optimizer_CF.optimize(theta_init, maxiter=1000, gtol=1e-5)
+t2 = time.time()
+
+===== CELL 32 (code) =====
+optimizer_CF2 = GradientOptimizer(
+    outgoing_dict= outgoing_links,
+    action_features= action_features_standard,
+    lambda_vec= lambda_sim,
+    tau= tau,
+    omega=omega,
+    M=5000,
+    alpha=alpha,  # estimated from simulation
+    Q=Q,
+    v=v,
+    c=c,
+    beta=beta,
+    init_mu=init_dist,
+    init_m=init_m,
+    outgoing_mask=outgoing_mask,
+    solve_sensitivities=solve_sensitivities_direct,
+    solve_fixed_point=compute_joint_fixed_point_final,
+    tol_m=1e-6,
+    tol_mu=1e-6,
+    max_iter = 300000,
+    method='msa',
+    restart_interval=30,
+    momentum=0.8,
+    lr=0.5,
+    phase1_tol=1e-4,
+    heuristic=None
+)
+
+# Run optimization
+t1 = time.time()
+#theta_init = np.array([2620.20588991])
+cf10000_reward = optimizer_CF2.objective([2620.20588991])
+t2 = time.time()
+
+===== CELL 33 (code) =====
+# Compute the policy from the optimal theta
+theta_opt = result.x  # Or specify the optimal value manually
+pi_opt = compute_softmax_policy_by_action_features(
+    action_features_standard, theta_opt, n_links, row_idx, col_idx
+)
+
+# Simulation
+avg_R, matched, traj, stats = run_simulation_real(
+    pi_opt, M=5000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+# Run a random walk for comparison
+pi_rw = make_uniform_policy(outgoing_links, n_links)
+avg_R_rw, matched_rw, traj_rw, stats_rw = run_simulation_real(
+    pi_rw, M=5000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+print(f'\n=== Comparison ===')
+print(f'Random Walk:  sim_R = {stats_rw["avg_reward"]:.2f}')
+print(f'Optimal:      sim_R = {stats["avg_reward"]:.2f}')
+
+===== CELL 34 (code) =====
+pi_opt = compute_softmax_policy_by_action_features(
+    action_features_standard, [54.85666074], n_links, row_idx, col_idx
+) #### 5000 optimal 
+
+summary_opt = run_repeated_simulation(pi_opt, 'optimal', n_runs=10) ### 5000 
+
+
+pi_cf = compute_softmax_policy_by_action_features(
+    action_features_standard, [2620.20588991], n_links, row_idx, col_idx
+) #### 5000 competition free
+
+summary_cf = run_repeated_simulation(pi_cf, 'competition_free', n_runs=10) ### 5000 
+
+
+===== CELL 35 (code) =====
+pi_opt_dc = compute_softmax_policy_by_action_features(
+    action_features_exp_standard, [22.25708192], n_links, row_idx, col_idx
+) #### 5000 optimal directly compute
+
+summary_opt_dc = run_repeated_simulation(pi_opt_dc, 'optimal_directly_compute', n_runs=10) ### 5000 
+
+
+===== CELL 36 (code) =====
+summary_opt_4h = run_repeated_simulation(pi_opt, 'optimal_4h', n_runs=10, sim_hours = 4) ### 5000 
+summary_opt_8h = run_repeated_simulation(pi_opt, 'optimal_8h', n_runs=10, sim_hours = 8) ### 5000 
+
+summary_cf_4h = run_repeated_simulation(pi_cf, 'competition_free_4h', n_runs=10, sim_hours = 4) ### 5000 
+summary_cf_8h = run_repeated_simulation(pi_cf, 'competition_free_8h', n_runs=10, sim_hours = 8) ### 5000 
+
+
+===== CELL 37 (code) =====
+summary_opt_8h
+
+===== CELL 38 (markdown) =====
+The two simulations use different matching mechanisms:
+
+## Old simulation (probabilistic matching)
+
+```python
+if random.random() < m_s[s]:    # Match probabilistically
+    matched
+```
+
+m_s is periodically updated using z_avg. The z_avg -> m_s -> mu feedback takes time to stabilize. Initially, z_avg is not stable, so m_s and R may be too high. As z_avg stabilizes, R gradually falls toward the fluid-model prediction.
+
+## New simulation (discrete matching)
+
+```python
+if waiting_passengers[s] > 0:   # Match when passengers are waiting
+    matched
+```
+
+There is no intermediate feedback through m_s. Passengers arrive according to a Poisson process; vehicles match if passengers are waiting and otherwise move on. The original note attributes similar 4h, 8h and 12h results to rapid balance between arrival and matching rates.
+
+## Summary
+
+The original note describes a z -> m -> mu -> z feedback loop in the old method and attributes the new results to direct matching after warmup. This is an archived interpretation, not a verified stationarity guarantee.
+
+===== CELL 39 (code) =====
+
+
+===== CELL 40 (code) =====
+
+
+===== CELL 41 (code) =====
+
+
+===== CELL 42 (code) =====
+#alpha
+M = 10000
+
+lambda_sim = lambda_vec * (M / 12000)
+
+
+# Prepare multiple policies
+pi_rw = make_uniform_policy(outgoing_links, n_links)
+pi_hotspot_low = make_hotspot_policy(outgoing_links, n_links, lambda_vec, temperature=0.5)
+pi_hotspot_high = make_hotspot_policy(outgoing_links, n_links, lambda_vec, temperature=2.0)
+
+
+
+
+
+all_trajectories = []
+all_z_avg = []
+for name, pi_est in policies_for_estimation.items():
+    avg_R, matched, traj, stats = run_simulation_real(
+        pi_est, M=M, sim_hours=12, warmup_hours=2, 
+        verbose=False, lambda_input=lambda_sim
+    )
+    all_trajectories.extend(traj)
+    all_z_avg.append(stats['z_avg'])
+z_avg_combined = np.mean(all_z_avg, axis=0)
+
+
+===== CELL 43 (code) =====
+# Save with a different filename for each experiment
+save_name = f'results/simulation_data_M10000_Sep12.pkl'
+sim_data = {
+    'trajectories': all_trajectories,
+    'z_avg_combined': z_avg_combined,
+    'all_z_avg': all_z_avg,
+    'lambda_sim': lambda_sim,
+    'M': M,
+    'alpha_hat': alpha_hat,
+}
+with open(save_name, 'wb') as f:
+    pickle.dump(sim_data, f)
+print(f'Saved {len(all_trajectories)} trajectories to {save_name}')
+
+# Estimate alpha
+alpha_hat, ll2 = estimate_alpha_from_trajectories(
+    all_trajectories, lambda_sim, tau, z_avg_combined
+)
+alpha = alpha_hat
+
+===== CELL 44 (code) =====
+alpha
+
+===== CELL 45 (code) =====
+optimizer_10000 = GradientOptimizer(
+    outgoing_dict= outgoing_links,
+    action_features= action_features_standard,
+    lambda_vec= lambda_sim,
+    tau= tau,
+    omega=omega,
+    M=M,
+    alpha=alpha,  # estimated from simulation
+    Q=Q,
+    v=v,
+    c=c,
+    beta=beta,
+    init_mu=init_dist,
+    init_m=init_m,
+    outgoing_mask=outgoing_mask,
+    solve_sensitivities=solve_sensitivities_direct,
+    solve_fixed_point=compute_joint_fixed_point_final,
+    tol_m=1e-6,
+    tol_mu=1e-6,
+    max_iter = 300000,
+    method='msa',
+    restart_interval=30,
+    momentum=0.8,
+    lr=0.5,
+    phase1_tol=1e-4
+)
+
+# Run optimization
+t1 = time.time()
+theta_init = np.array([0.0])
+result = optimizer_10000.optimize(theta_init, maxiter=1000, gtol=1e-5)
+t2 = time.time()
+
+===== CELL 46 (code) =====
+feat_ranges = np.array([features[k].max() - features[k].min() for k in range(len(features))])
+
+theta_original_hist = [theta_std / (feat_ranges + 1e-8) for theta_std in optimizer_10000.theta_hist]
+
+===== CELL 47 (code) =====
+theta_original_hist 
+
+===== CELL 48 (code) =====
+# After optimization
+import pickle
+
+parameter_dict = dict(alpha=alpha, beta=beta, tol_m = 1e-6, tol_mu = 1e-6, method = 'msa', intervals = 30, M = M, gtol=1e-5)
+
+results_to_save = {
+    'theta_hist': optimizer_10000.theta_hist,
+    'theta_hist_original': theta_original_hist,
+    'R_hist': optimizer_10000.R_hist,
+    'theta_hist_BFGS': optimizer_10000.iter_theta_hist,
+    'R_hist_BFGS': optimizer_10000.iter_R_hist,
+    'm_hist': optimizer_10000.m_hist,
+    'mu_hist': optimizer_10000.mu_hist,
+    'state_hist': optimizer_10000.state_hist,
+    'optimal_theta': result.x,
+    'optimal_R': -result.fun,
+    'Duration': t2-t1,
+    'nfev': result.nfev,
+    'njev': result.njev,
+    'Full_result': result,
+    'Parameters': parameter_dict
+}
+
+with open('results/optimization_results_M10000_SEP15_optimal_lINK_SCALE.pkl', 'wb') as f:
+    pickle.dump(results_to_save, f)
+
+===== CELL 49 (code) =====
+theta_opt
+
+===== CELL 50 (code) =====
+# Compute the policy from the optimal theta
+theta_opt = result.x  # Or specify the optimal value manually
+pi_opt = compute_softmax_policy_by_action_features(
+    action_features_standard, theta_opt, n_links, row_idx, col_idx
+)
+
+# Simulation
+avg_R, matched, traj, stats = run_simulation_real(
+    pi_opt, M=10000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+# Run a random walk for comparison
+pi_rw = make_uniform_policy(outgoing_links, n_links)
+avg_R_rw, matched_rw, traj_rw, stats_rw = run_simulation_real(
+    pi_rw, M=10000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+print(f'\n=== Comparison ===')
+print(f'Random Walk:  sim_R = {stats_rw["avg_reward"]:.2f}')
+print(f'Optimal:      sim_R = {stats["avg_reward"]:.2f}')
+
+===== CELL 51 (code) =====
+
+
+===== CELL 52 (code) =====
+#### M = 10000 with the same trajectory, lambda_sim, and alpha as M=5000
+
+===== CELL 53 (code) =====
+#alpha
+M = 5000
+
+lambda_sim = lambda_vec * (M / 12000)
+
+with open("results/simulation_data_M5000_Jun9_iter0.pkl", "rb") as f:
+    all_trajectories_saved = pickle.load(f)
+    
+all_trajectories = all_trajectories_saved['trajectories']
+z_avg_combined = all_trajectories_saved['z_avg_combined']
+
+# Estimate alpha
+alpha_hat, ll2 = estimate_alpha_from_trajectories(
+    all_trajectories, lambda_sim, tau, z_avg_combined
+)
+alpha = alpha_hat
+
+alpha
+
+===== CELL 54 (code) =====
+optimizer_10000_same = GradientOptimizer(
+    outgoing_dict= outgoing_links,
+    action_features= action_features_standard,
+    lambda_vec= lambda_sim,
+    tau= tau,
+    omega=omega,
+    M=10000,
+    alpha=alpha,  # estimated from simulation
+    Q=Q,
+    v=v,
+    c=c,
+    beta=beta,
+    init_mu=init_dist,
+    init_m=init_m,
+    outgoing_mask=outgoing_mask,
+    solve_sensitivities=solve_sensitivities_direct,
+    solve_fixed_point=compute_joint_fixed_point_final,
+    tol_m=1e-6,
+    tol_mu=1e-6,
+    max_iter = 300000,
+    method='msa',
+    restart_interval=30,
+    momentum=0.8,
+    lr=0.5,
+    phase1_tol=1e-4
+)
+
+# Run optimization
+t1 = time.time()
+theta_init = np.array([0.0])
+result = optimizer_10000_same.optimize(theta_init, maxiter=1000, gtol=1e-5)
+t2 = time.time()
+
+===== CELL 55 (code) =====
+feat_ranges = np.array([features[k].max() - features[k].min() for k in range(len(features))])
+
+theta_original_hist = [theta_std / (feat_ranges + 1e-8) for theta_std in optimizer_10000_same.theta_hist]
+
+theta_original_hist
+
+===== CELL 56 (code) =====
+# After optimization
+import pickle
+
+parameter_dict = dict(alpha=alpha, beta=beta, tol_m = 1e-6, tol_mu = 1e-6, method = 'msa', intervals = 30, M = M, gtol=1e-5)
+
+results_to_save = {
+    'theta_hist': optimizer_10000_same.theta_hist,
+    'theta_hist_original': theta_original_hist,
+    'R_hist': optimizer_10000_same.R_hist,
+    'theta_hist_BFGS': optimizer_10000_same.iter_theta_hist,
+    'R_hist_BFGS': optimizer_10000_same.iter_R_hist,
+    'm_hist': optimizer_10000_same.m_hist,
+    'mu_hist': optimizer_10000_same.mu_hist,
+    'state_hist': optimizer_10000_same.state_hist,
+    'optimal_theta': result.x,
+    'optimal_R': -result.fun,
+    'Duration': t2-t1,
+    'nfev': result.nfev,
+    'njev': result.njev,
+    'Full_result': result,
+    'Parameters': parameter_dict
+}
+
+with open('results/optimization_results_M10000_SEP16_optimal_lINK_SCALE_SAME_TRAJ_AS_5000.pkl', 'wb') as f:
+    pickle.dump(results_to_save, f)
+
+===== CELL 57 (code) =====
+# Compute the policy from the optimal theta
+theta_opt = result.x  # Or specify the optimal value manually
+pi_opt = compute_softmax_policy_by_action_features(
+    action_features_standard, theta_opt, n_links, row_idx, col_idx
+)
+
+# Simulation
+avg_R, matched, traj, stats = run_simulation_real(
+    pi_opt, M=10000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+# Run a random walk for comparison
+pi_rw = make_uniform_policy(outgoing_links, n_links)
+avg_R_rw, matched_rw, traj_rw, stats_rw = run_simulation_real(
+    pi_rw, M=10000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+print(f'\n=== Comparison ===')
+print(f'Random Walk:  sim_R = {stats_rw["avg_reward"]:.2f}')
+print(f'Optimal:      sim_R = {stats["avg_reward"]:.2f}')
+
+===== CELL 58 (code) =====
+optimizer_10000_same_CF = GradientOptimizer(
+    outgoing_dict= outgoing_links,
+    action_features= action_features_standard,
+    lambda_vec= lambda_sim,
+    tau= tau,
+    omega=omega,
+    M=10000,
+    alpha=alpha,  # estimated from simulation
+    Q=Q,
+    v=v,
+    c=c,
+    beta=beta,
+    init_mu=init_dist,
+    init_m=init_m,
+    outgoing_mask=outgoing_mask,
+    solve_sensitivities=solve_sensitivities_direct,
+    solve_fixed_point=compute_joint_fixed_point_final,
+    tol_m=1e-6,
+    tol_mu=1e-6,
+    max_iter = 300000,
+    method='msa',
+    restart_interval=30,
+    momentum=0.8,
+    lr=0.5,
+    phase1_tol=1e-4,
+    heuristic='CF'
+)
+
+# Run optimization
+t1 = time.time()
+theta_init = np.array([0.0])
+result = optimizer_10000_same_CF.optimize(theta_init, maxiter=1000, gtol=1e-5)
+t2 = time.time()
+
+===== CELL 59 (code) =====
+alpha
+
+===== CELL 60 (code) =====
+feat_ranges = np.array([features[k].max() - features[k].min() for k in range(len(features))])
+
+theta_original_hist = [theta_std / (feat_ranges + 1e-8) for theta_std in optimizer_10000_same_CF.theta_hist]
+
+theta_original_hist
+
+===== CELL 61 (code) =====
+optimizer_10000_same_CF2 = GradientOptimizer(
+    outgoing_dict= outgoing_links,
+    action_features= action_features_standard,
+    lambda_vec= lambda_sim,
+    tau= tau,
+    omega=omega,
+    M=10000,
+    alpha=alpha,  # estimated from simulation
+    Q=Q,
+    v=v,
+    c=c,
+    beta=beta,
+    init_mu=init_dist,
+    init_m=init_m,
+    outgoing_mask=outgoing_mask,
+    solve_sensitivities=solve_sensitivities_direct,
+    solve_fixed_point=compute_joint_fixed_point_final,
+    tol_m=1e-6,
+    tol_mu=1e-6,
+    max_iter = 300000,
+    method='msa',
+    restart_interval=30,
+    momentum=0.8,
+    lr=0.5,
+    phase1_tol=1e-4,
+    heuristic=None
+)
+
+# Run optimization
+t1 = time.time()
+#theta_init = np.array([2620.20588991])
+cf10000_reward = optimizer_10000_same_CF2.objective([2620.20588991])
+t2 = time.time()
+
+===== CELL 62 (markdown) =====
+At theta=2620, softmax is nearly argmax, concentrating vehicles on links with the highest feature values. The original note identifies the following effects:
+
+1. **Nearly deterministic policy**: the original note suggests that small changes in mu can flip choices on some links.
+2. **Unstable fixed point**: concentrated mu -> changes in m -> changes in P -> jumps in mu -> repeated oscillation.
+3. **Nonmonotonic m_res**: 0.80 -> 3.4e-3 -> 1.3e-3 -> 8.2e-4 -> 9.2e-4 (increases again), followed by oscillation between 1e-3 and 1e-5.
+
+The original note attributes the oscillation to numerical instability at extreme theta and describes an MSA step size $\gamma = 1/k$ that decays too slowly. This is an archived explanation; inspect the actual implemented update rule separately.
+
+R has not yet reached its fixed-point value. The initial R=75 comes from the warm start (init_m=0.2, uniform init_mu), which the original note describes as far from equilibrium.
+
+The original note interprets the falling R as convergence toward a fixed-point reward near -25 or lower, while m_res oscillates near 1e-5 and fails to reach 1e-6.
+
+The original note suggests relaxing the tolerance to 1e-4:
+
+```python
+optimizer = GradientOptimizer(..., tol_m=1e-4, tol_mu=1e-4)
+```
+
+The original note concludes that R is approximately stable near -25 and that the CF-optimal theta performs poorly under the standard model.
+
+===== CELL 63 (code) =====
+# Compute the policy from the optimal theta
+theta_opt = result.x  # Or specify the optimal value manually
+pi_opt = compute_softmax_policy_by_action_features(
+    action_features_standard, theta_opt, n_links, row_idx, col_idx
+)
+
+# Simulation
+avg_R, matched, traj, stats = run_simulation_real(
+    pi_opt, M=10000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+# Run a random walk for comparison
+pi_rw = make_uniform_policy(outgoing_links, n_links)
+avg_R_rw, matched_rw, traj_rw, stats_rw = run_simulation_real(
+    pi_rw, M=10000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+print(f'\n=== Comparison ===')
+print(f'Random Walk:  sim_R = {stats_rw["avg_reward"]:.2f}')
+print(f'Optimal:      sim_R = {stats["avg_reward"]:.2f}')
+
+===== CELL 64 (code) =====
+optimizer_CF.mu_hist[-1]
+
+===== CELL 65 (code) =====
+optimizer_10000_same_CF.mu_hist[-1]
+
+===== CELL 66 (code) =====
+opt_10000 = pd.read_pickle('results/optimization_results_M10000_SEP16_optimal_lINK_SCALE_SAME_TRAJ_AS_5000.pkl')
+
+===== CELL 67 (code) =====
+opt_10000
+
+===== CELL 68 (code) =====
+summary_rw_10000 = run_repeated_simulation(pi_rw, 'random_walk', n_runs=10, M = 10000) ### 10000 
+
+pi_opt_10000 = compute_softmax_policy_by_action_features(
+    action_features_standard, [36.97828095], n_links, row_idx, col_idx
+) #### 5000 optimal 
+
+summary_opt_10000 = run_repeated_simulation(pi_opt_10000, 'optimal', n_runs=10, M = 10000) ### 10000 
+
+
+pi_cf_10000 = compute_softmax_policy_by_action_features(
+    action_features_standard, [2620.20588991], n_links, row_idx, col_idx
+) #### 5000 competition free
+
+summary_cf_10000 = run_repeated_simulation(pi_cf_10000, 'competition_free', n_runs=10, M = 10000) ### 10000 
+
+
+===== CELL 69 (code) =====
+
+
+===== CELL 70 (code) =====
+# After optimization
+import pickle
+
+parameter_dict = dict(alpha=0.859550671540191, beta=beta, tol_m = 1e-6, tol_mu = 1e-6, method = 'msa', intervals = 30, M = M, gtol=1e-5)
+
+results_to_save = {
+    'theta_hist': optimizer_CF.theta_hist,
+    'theta_hist_original': theta_original_hist,
+    'R_hist': optimizer_CF.R_hist,
+    'theta_hist_BFGS': optimizer_CF.iter_theta_hist,
+    'R_hist_BFGS': optimizer_CF.iter_R_hist,
+    'm_hist': optimizer_CF.m_hist,
+    'mu_hist': optimizer_CF.mu_hist,
+    'state_hist': optimizer_CF.state_hist,
+    'Parameters': parameter_dict
+}
+
+with open('results/optimization_results_M5000_SEP18_Competition_Free_no_results.pkl', 'wb') as f:
+    pickle.dump(results_to_save, f)
+
+===== CELL 71 (code) =====
+### generate trajectory code: in "Fleet Final"
+### previous trajecory function: 2 elements; new: 4 elements
+
+===== CELL 72 (code) =====
+opt_5000 = pd.read_pickle('results/optimization_results_M5000_SEP12_optimal_lINK_SCALE.pkl')
+m_5000 = opt_5000['m_hist'][0]
+m_5000.mean()
+
+===== CELL 73 (code) =====
+# Expected fare per link  directly expected profit
+# = m[s] * Σ_d dest[s,d] * v[s,d]
+alpha = 0.859550671540191
+beta = 30
+m_rw = m_5000.copy()
+expected_fare = m_rw * np.sum(Q * v, axis=1)
+
+# Expected cost per link
+# = beta * (tau[s] + m[s] * omega[s])
+expected_cost = beta * (tau + m_rw * omega)
+
+# Expected profit per link
+expected_profit = expected_fare - expected_cost
+
+===== CELL 74 (code) =====
+features_exp = [expected_profit]
+
+action_features_exp_standard = features_exp.copy()
+# Normalize features to [0, 1] or [-1, 1]
+for k in range(len(action_features_exp_standard)):
+    feat = action_features_exp_standard[k]
+    feat_min = feat.min()
+    feat_max = feat.max()
+    action_features_exp_standard[k] = (feat - feat_min) / (feat_max - feat_min + 1e-8)
+    
+action_features_exp_standard
+
+===== CELL 75 (code) =====
+### Optimal policy M = 5000 directly compute
+
+M = 5000
+
+optimizer_DC = GradientOptimizer(
+    outgoing_dict= outgoing_links,
+    action_features= action_features_exp_standard,
+    lambda_vec= lambda_sim,
+    tau= tau,
+    omega=omega,
+    M=M,
+    alpha=alpha,  # estimated from simulation
+    Q=Q,
+    v=v,
+    c=c,
+    beta=beta,
+    init_mu=init_dist,
+    init_m=init_m,
+    outgoing_mask=outgoing_mask,
+    solve_sensitivities=solve_sensitivities_direct,
+    solve_fixed_point=compute_joint_fixed_point_final,
+    tol_m=1e-6,
+    tol_mu=1e-6,
+    max_iter = 300000,
+    method='msa',
+    restart_interval=30,
+    momentum=0.8,
+    lr=0.5,
+    phase1_tol=1e-4,
+    heuristic = None
+)
+
+# Run optimization
+t1 = time.time()
+theta_init = np.array([0.0])
+result = optimizer_DC.optimize(theta_init, maxiter=1000, gtol=1e-5)
+t2 = time.time()
+
+===== CELL 76 (code) =====
+feat_ranges = np.array([features[k].max() - features[k].min() for k in range(len(features))])
+
+theta_original_hist = [theta_std / (feat_ranges + 1e-8) for theta_std in optimizer_DC.theta_hist]
+
+theta_original_hist
+
+===== CELL 77 (code) =====
+# After optimization
+import pickle
+
+parameter_dict = dict(alpha=alpha, beta=beta, tol_m = 1e-6, tol_mu = 1e-6, method = 'msa', intervals = 30, M = M, gtol=1e-5)
+
+results_to_save = {
+    'theta_hist': optimizer_DC.theta_hist,
+    'theta_hist_original': theta_original_hist,
+    'R_hist': optimizer_DC.R_hist,
+    'theta_hist_BFGS': optimizer_DC.iter_theta_hist,
+    'R_hist_BFGS': optimizer_DC.iter_R_hist,
+    'm_hist': optimizer_DC.m_hist,
+    'mu_hist': optimizer_DC.mu_hist,
+    'state_hist': optimizer_DC.state_hist,
+    'optimal_theta': result.x,
+    'optimal_R': -result.fun,
+    'Duration': t2-t1,
+    'nfev': result.nfev,
+    'njev': result.njev,
+    'Full_result': result,
+    'Parameters': parameter_dict
+}
+
+with open('results/optimization_results_M5000_SEP22_optimal_lINK_SCALE_Directly_Compute_Profit_Correct.pkl', 'wb') as f:
+    pickle.dump(results_to_save, f)
+
+===== CELL 78 (code) =====
+# Compute the policy from the optimal theta
+theta_opt = result.x  # Or specify the optimal value manually
+pi_opt = compute_softmax_policy_by_action_features(
+    action_features_exp_standard, theta_opt, n_links, row_idx, col_idx
+)
+
+# Simulation
+avg_R, matched, traj, stats = run_simulation_real(
+    pi_opt, M=5000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+# Run a random walk for comparison
+pi_rw = make_uniform_policy(outgoing_links, n_links)
+avg_R_rw, matched_rw, traj_rw, stats_rw = run_simulation_real(
+    pi_rw, M=5000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+print(f'\n=== Comparison ===')
+print(f'Random Walk:  sim_R = {stats_rw["avg_reward"]:.2f}')
+print(f'Optimal:      sim_R = {stats["avg_reward"]:.2f}')
+
+===== CELL 79 (code) =====
+# Run a random walk for comparison
+pi_rw = make_uniform_policy(outgoing_links, n_links)
+avg_R_rw, matched_rw, traj_rw, stats_rw = run_simulation_real(
+    pi_rw, M=5000, sim_hours=12, warmup_hours=2, verbose=True, lambda_input=lambda_sim  # Pass the explicit demand vector
+)
+
+===== CELL 80 (code) =====
+
+
+===== CELL 81 (code) =====
+
+
+===== CELL 82 (code) =====
+def evaluate_expected_fare_and_cost_matrix(
+    m, pi, p, r, r_cost, tau, tau_sd, beta,
+    max_iter=5000, tol=1e-6
+):
+    """
+    Fully vectorized policy evaluation to compute expected fare and cost for each link.
+
+    Parameters:
+    - m: (n_links,) array, match probability
+    - pi: (n_links, n_links) array, policy π(a|s)
+    - p: (n_links, n_links) array, destination prob p(d|s)
+    - r: (n_links, n_links) array, fare from s to d
+    - r_cost: (n_links, n_links) array, cost from s to d
+    - tau: (n_links,) array, travel time for each link
+    - tau_sd: (n_links, n_links) array, shortest time from s to d
+    - beta: float, discount log rate
+
+    Returns:
+    - f: (n_links,) expected fare
+    - c: (n_links,) expected cost
+    """
+    n_links = len(m)
+    f = np.zeros(n_links)
+    c = np.zeros(n_links)
+
+    discount_sd = np.exp(-beta * tau_sd)      # shape = (n_links, n_links)
+    discount_links = np.exp(-beta * tau)      # shape = (n_links,)
+
+    for it in range(max_iter):
+        # Matched terms
+        f_matched = np.sum(p * (r + discount_sd * f[np.newaxis, :]), axis=1)   # (n_links,)
+        c_matched = np.sum(p * (r_cost + discount_sd * c[np.newaxis, :]), axis=1)
+
+        # Unmatched terms
+        f_unmatched = pi @ (discount_links * f)       # (n_links,)
+        c_unmatched = pi @ (discount_links * c) # (n_links,)
+        
+        # Combine matched and unmatched parts
+        f_new = m * f_matched + (1 - m) * f_unmatched
+        c_new = 30*tau + m * c_matched + (1 - m) * c_unmatched
+
+        # Convergence check
+        delta_f = np.max(np.abs(f_new - f))
+        delta_c = np.max(np.abs(c_new - c))
+        print(f"Ite {it}: Δf = {delta_f:.4e}, Δc = {delta_c:.4e}")
+
+        if delta_f < tol and delta_c < tol:
+            break
+
+        f, c = f_new, c_new
+
+    return f, c
+
+exp_f, exp_c = evaluate_expected_fare_and_cost_matrix(
+    m_5000, pi_5000, Q, v, c*30, tau, c, beta = 0.1,
+    max_iter=5000, tol=5e-1
+)
+
+===== CELL 83 (code) =====
+feature_profit_final something wrong but generate better R, so keep using it
+exp_f, exp_c  bellman expected profit with corrected network 
+expected_profit  directly computed profit
+
+===== CELL 84 (code) =====
