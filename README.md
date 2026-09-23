@@ -3,26 +3,6 @@
 Link-based fleet routing with a shared optimization and simulation implementation
 for Shanghai and a synthetic small network. All comments and documentation are in English.
 
-## Start in PyCharm
-
-1. Extract this project into a new folder and open that folder in PyCharm.
-2. Select your existing Conda interpreter:
-   `/opt/anaconda3/envs/fleet-routing/bin/python`.
-   Reuse this interpreter for each saved Run Configuration; no new environment is needed.
-3. Open the PyCharm Terminal at the project root and run:
-   ```bash
-   conda activate fleet-routing
-   python -m pip install -r requirements.txt
-   ```
-4. Right-click `scripts/run_tests.py` and select Run. This needs no Shanghai data.
-5. Copy your Shanghai input files to `data/shanghai/`, edit `configs/shanghai.py`,
-   and run the appropriate script below.
-
-Scripts work when launched directly in PyCharm or by absolute path, independently
-of the working directory. They locate the project through `scripts/_bootstrap.py`.
-For notebooks and imports outside these scripts, install the package once from the
-project root with `python -m pip install -e .`. Do not run library modules directly.
-
 ## Project layout
 
 | Location | Responsibility |
